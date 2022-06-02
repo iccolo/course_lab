@@ -18,6 +18,13 @@ package raft
 //
 
 import (
+	"6.824/labgob"
+	"bytes"
+	"fmt"
+	"log"
+	"math/rand"
+	"time"
+
 	//	"bytes"
 	"sync"
 	"sync/atomic"
@@ -62,17 +69,87 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
+	applyCh               chan ApplyMsg
+	persistenceObj        *persistenceObj // 需要持久化的数据，在Raft创建时读取并初始化
+	leaderHeartBeat       chan struct{}   // 接收Leader心跳并更新定时器，在Raft创建时初始化
+	peersMaxLogIndexes    []int           // 作为Leader时，其他节点的Max Log Index，初始化时会设定为Leader的Max Log Index
+	peersAckMaxLogIndexes []int           // 作为Leader时，其他节点的Max Ack Log Index，初始化设定-1
+	tryApply              chan struct{}   // 通知Apply goroutine发送ApplyMsg
+	maxAppliedLogIndex    int             // 作为Follower时，Max Applied Log Index，初始化设定-1
+}
 
+func (rf *Raft) Debug(format string, args ...interface{}) {
+	prefix := fmt.Sprintf("[node %d]", rf.me)
+	log.Printf(prefix+format, args...)
+}
+
+func (rf *Raft) Error(format string, args ...interface{}) {
+	prefix := fmt.Sprintf("[node %d]", rf.me)
+	log.Printf(prefix+format, args...)
+}
+
+type persistenceObj struct {
+	curTerm int
+	voteFor int
+	slots   []*Log
+}
+
+type Log struct {
+	Index   int
+	Term    int
+	Command interface{}
+}
+
+func (rf *Raft) getLastLogInfo() (index, term int) {
+	slots := rf.persistenceObj.slots
+	if len(slots) == 0 {
+		return 0, 0
+	}
+	lastLog := slots[len(slots)-1]
+	return lastLog.Index, lastLog.Term
+}
+
+func (rf *Raft) getLastLogIndex() int {
+	slots := rf.persistenceObj.slots
+	if len(slots) == 0 {
+		return 0
+	}
+	return slots[len(slots)-1].Index
+}
+
+func (rf *Raft) getLastLogTerm() int {
+	slots := rf.persistenceObj.slots
+	if len(slots) == 0 {
+		return 0
+	}
+	return slots[len(slots)-1].Term
+}
+
+func (rf *Raft) getLatestNLog(n int) *Log {
+	slots := rf.persistenceObj.slots
+	if n <= 0 || len(slots) <= n {
+		return nil
+	}
+	return slots[len(slots)-n]
+}
+
+func (rf *Raft) getLogByIndex(index int) *Log {
+	slots := rf.persistenceObj.slots
+	if len(slots) == 0 {
+		return nil
+	}
+	i := index - slots[0].Index
+	if i < 0 || i >= len(slots){
+		return nil
+	}
+	return slots[i]
 }
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
-	var term int
-	var isleader bool
 	// Your code here (2A).
-	return term, isleader
+	return rf.persistenceObj.curTerm, rf.me == rf.persistenceObj.voteFor && len(rf.peers)/len(rf.votes) < 2
 }
 
 //
@@ -89,6 +166,12 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	enc := labgob.NewEncoder(w)
+	if err := enc.Encode(rf.persistenceObj); err != nil {
+		DPrintf("persis encode err:%v", err)
+	}
+	rf.persister.SaveRaftState(w.Bytes())
 }
 
 //
@@ -111,6 +194,11 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+	rf.persistenceObj = new(persistenceObj)
+	dec := labgob.NewDecoder(bytes.NewBuffer(data))
+	if err := dec.Decode(rf.persistenceObj); err != nil {
+		panic(err)
+	}
 }
 
 //
@@ -139,6 +227,10 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	From int
+	Term int
+	LatestLogIndex int
+	LatestLogTerm  int
 }
 
 //
@@ -147,6 +239,7 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+	IsAgree bool
 }
 
 //
@@ -154,6 +247,19 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	rf.Debug("receive RequestVote, args:%+v", args)
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if args.LatestLogTerm > rf.persistenceObj.curTerm ||
+		(args.LatestLogTerm == rf.persistenceObj.curTerm && args.LatestLogIndex >= rf.getLastLogIndex()) {
+		rf.persistenceObj.curTerm = args.Term
+		rf.persistenceObj.voteFor = args.From
+		rf.persist()
+		reply.IsAgree = true
+		rf.Debug("accept node %d as leader", args.From)
+		return
+	}
+	rf.Debug("refuse node %d as leader", args.From)
 }
 
 //
@@ -186,8 +292,92 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // the struct itself.
 //
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
+	rf.Debug("RequestVote args:%+v", args)
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	rf.Debug("RequestVote reply:%+v", reply)
 	return ok
+}
+
+type AppendEntryArgs struct {
+	From int // 源节点
+	Term int // Leader任期号
+	PrevLogIndex int // Follower在相应位置有log且log term与PrevLogTerm一致才能用此消息更新log
+	PrevLogTerm  int
+	Slots        []*Log // PrevLogIndex之后的的所有Log，不包含PrevLogIndex位置
+}
+
+// AppendEntryReply 支持follower快速恢复log的响应
+type AppendEntryReply struct {
+	XTerm  int // 这个是Follower中与Leader冲突的Log对应的任期号。在之前（7.1）有介绍Leader会在prevLogTerm中带上本地Log记录中，前一条Log的任期号。如果Follower在对应位置的任期号不匹配，它会拒绝Leader的AppendEntry消息，并将自己的任期号放在XTerm中。如果Follower在对应位置没有Log，那么这里会返回 -1。
+	XIndex int // 这个是Follower中，对应任期号为XTerm的第一条Log条目的槽位号。
+	XLen   int // 如果Follower在对应位置没有Log，那么XTerm会返回-1，XLen表示空白的Log槽位数。
+}
+
+func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
+	rf.Debug("receive AppendEntry, args:%+v",  args)
+	if args.Term < rf.persistenceObj.curTerm || (args.Term == rf.persistenceObj.curTerm && args.From != rf.persistenceObj.voteFor){
+		rf.Error("invalid AppendEntry:%+v", args) // TODO how to fill rsp
+		return
+	}
+
+	// 接收首次Log
+	if args.PrevLogIndex == 0 {
+		rf.persistenceObj.slots = args.Slots
+		rf.persistenceObj.curTerm = args.Term
+		rf.persistenceObj.voteFor = args.From
+		return
+	}
+
+	// Follower对应位置没有Log
+	preLog := rf.getLogByIndex(args.PrevLogIndex)
+	if preLog == nil {
+		reply.XTerm = -1
+		reply.XLen = args.PrevLogIndex - rf.getLastLogIndex()
+		return
+	}
+	// 有Log
+	reply.XTerm = preLog.Term
+	reply.XIndex = args.PrevLogIndex
+	for ; reply.XIndex - 1 > 0;  {
+		if l := rf.getLogByIndex(reply.XIndex -1); l == nil || l.Term != reply.XTerm {
+			break
+		}
+		reply.XIndex--
+	}
+	// 对应位置Log Term相同，更新Log
+	if preLog.Term == args.PrevLogTerm {
+		rf.persistenceObj.curTerm = args.Term
+		rf.persistenceObj.voteFor = args.From
+		rf.persistenceObj.slots = append(rf.persistenceObj.slots[:], args.Slots...)
+
+	}
+	lastLog := rf.getLatestNLog(1)
+	if lastLog == nil  {
+		reply.XTerm = -1
+		reply.XLen = args.PrevLogIndex+1
+		return
+	}
+	if lastLog.Index < args.PrevLogIndex {
+
+		reply.XTerm = -1
+		reply.XLen = args.PrevLogIndex - rf.getLatestNLog(1).Index
+		return
+	}
+
+	selfPrevLog := rf.getLogByIndex(args.PrevLogIndex)
+
+	if args.PrevLogIndex <= rf.getLatestNLog(1).Index {
+		if ;selfLog != nil && args.PrevLogTerm == selfLog.LeaderTerm {
+			for i, log := range args.Slots {
+
+			}
+		}
+	}
+}
+
+func (rf *Raft) sendAppendEntry(server int, args *AppendEntryArgs, reply *AppendEntryReply) bool {
+	rf.Debug("begin AppendEntry to node %d, args:%+v", server, args)
+	return rf.peers[server].Call("Raft.AppendEntry", args, reply)
 }
 
 //
@@ -204,13 +394,24 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // term. the third return value is true if this server believes it is
 // the leader.
 //
-func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
-
-	// Your code here (2B).
-
+func (rf *Raft) Start(command interface{}) (index int, term int, isLeader bool) {
+	// 串行化追加log
+	rf.mu.Lock()
+	term, isLeader = rf.GetState()
+	if !isLeader {
+		return -1, -1, false
+	}
+	index = rf.getLatestNLog(1).Index + 1
+	rf.persistenceObj.slots = append(rf.persistenceObj.slots, &Log{
+		Index:   index,
+		Term:    term,
+		Command: command,
+	})
+	labgob.Register(command)
+	rf.persist()
+	rf.mu.Unlock()
+	// 通知其他节点
+	go rf.syncAllPeer()
 	return index, term, isLeader
 }
 
@@ -243,7 +444,213 @@ func (rf *Raft) ticker() {
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep().
+		if _, isLeader := rf.GetState(); isLeader {
+			rf.Debug("is leader, no ticker")
+			return
+		}
+		interval := getElectionTimerInterval()
+		t := time.NewTimer(interval)
+		rf.Debug("start election timer, timer interval:%v", rf.me, interval)
+		select {
+		case <-rf.leaderHeartBeat:
+			interval = getElectionTimerInterval()
+			t = time.NewTimer(interval)
+			rf.Debug("restart election timer, timer interval:%v", rf.me, interval)
+		case <-t.C:
+			rf.campaign()
+		}
+	}
+	rf.Debug("be killed")
+}
 
+const (
+	leaderHeartBeatInterval      = 3000 // 心跳间隔，单位ms
+	electionTimerIntervalRateMin = 2    // 最小选举定时器与心跳间隔比值
+	electionTimerIntervalRateMax = 3    // 最大选举定时器与心跳间隔比值
+)
+
+func getElectionTimerInterval() time.Duration {
+	minInterval := electionTimerIntervalRateMin * leaderHeartBeatInterval
+	maxInterval := electionTimerIntervalRateMax * leaderHeartBeatInterval
+	r := rand.New(rand.NewSource(int64(time.Now().Nanosecond())))
+	randAdd := r.Intn(maxInterval - minInterval)
+	return time.Duration(minInterval+randAdd) * time.Millisecond
+}
+
+// 竞选Leader：任期号增加 && 投票给自己 && 发送 RequestVote
+func (rf *Raft) campaign() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	newTerm := rf.persistenceObj.curTerm + 1
+	votesCnt := int64(1) // 当前任期获得的Leader选票数量
+
+	rf.Debug("begin campaign term:%d", newTerm)
+
+	wg := new(sync.WaitGroup)
+	for i := 0; i < len(rf.peers); i++ {
+		if i == rf.me {
+			continue
+		}
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			req := &RequestVoteArgs{
+				From: rf.me,
+				Term: newTerm,
+			}
+			req.LatestLogIndex, req.LatestLogTerm = rf.getLastLogInfo()
+			rsp := &RequestVoteReply{}
+			if ok := rf.sendRequestVote(i, req, rsp); ok && rsp.IsAgree {
+				rf.Debug("won votes from node %d in term %d", newTerm, i)
+				atomic.AddInt64(&votesCnt, 1)
+			}
+		}(i)
+	}
+	wg.Wait()
+	rf.Debug("votesCnt %d", votesCnt)
+	// 判断投票结果
+	if votesCnt*2 <= int64(len(rf.peers)) {
+		return
+	}
+	rf.persistenceObj.curTerm++
+	rf.persistenceObj.voteFor = rf.me
+	rf.persist()
+	rf.Debug("being leader, term %v", rf.persistenceObj.curTerm)
+	go rf.afterWonCampaign()
+}
+
+// 竞选成功：建立PeerMaxLogIndex && 发送 AppendEntry
+func (rf *Raft) afterWonCampaign() {
+	rf.initPeerMaxLogIndex()
+	rf.initPeersAckMaxLogIndexes()
+	go rf.leaderApply()
+	rf.syncAllPeer()
+}
+
+// Leader初始化PeerMaxLogIndex，刚开始所有节点的Max Log Index设置为与Leader一致
+func (rf *Raft) initPeerMaxLogIndex() {
+	rf.peersMaxLogIndexes = make([]int, len(rf.peers))
+	for i := 0; i < len(rf.peers); i++ {
+		rf.peersMaxLogIndexes[i] = rf.getLastLogIndex()
+	}
+}
+
+// Leader初始化PeerAckMaxLogIndex，刚开始所有节点的Max Ack Log Index设置为0
+func (rf *Raft) initPeersAckMaxLogIndexes() {
+	rf.peersAckMaxLogIndexes = make([]int, len(rf.peers))
+}
+
+func (rf *Raft) syncAllPeer() {
+	// 通知其他节点对齐Log
+	wg := new(sync.WaitGroup)
+	for i := 0; i < len(rf.peers); i++ {
+		if i == rf.me {
+			continue
+		}
+		wg.Add(1)
+		go func(server int) {
+			defer wg.Done()
+			rf.syncPeer(server)
+		}(i)
+	}
+	wg.Wait()
+}
+
+func (rf *Raft) syncPeer(server int) {
+	req := rf.genAppendEntry(server)
+	rsp := &AppendEntryReply{}
+	if ok := rf.sendAppendEntry(server, req, rsp); !ok {
+		rf.Debug("sendAppendEntry to node %d fail", server)
+		return
+	}
+	// Follower在相同位置有相同Log，说明Log已对齐
+	if rsp.XTerm == req.PrevLogTerm {
+		ackIndex := calculateAckIndex(req)
+		rf.peersMaxLogIndexes[server] = ackIndex
+		rf.peersAckMaxLogIndexes[server] = ackIndex
+		rf.tryApply <- struct{}{}
+		rf.Debug("node %d ack index %d", server, ackIndex)
+		return
+	}
+	// Follower在pre log index没有log，需要再次同步
+	if rsp.XTerm == -1 {
+		rf.Debug("node %d has no log at preIndex %d, will sync again", server, req.PrevLogIndex)
+		rf.peersMaxLogIndexes[server] = req.PrevLogIndex - rsp.XLen
+		rf.syncPeer(server)
+		return
+	}
+	rf.Debug("node %d has diff log term %d after index %d, will sync again", server, rsp.XTerm, rsp.XIndex)
+	// Follower在pre log index有不同的log，需要将整个任期的log同步过去进行覆盖
+	rf.peersMaxLogIndexes[server] = rsp.XIndex - 1
+	rf.syncPeer(server)
+}
+
+func (rf *Raft) genAppendEntry(server int) *AppendEntryArgs {
+	var (
+		preIndex = rf.peersMaxLogIndexes[server]
+		preTerm = 0
+	)
+	if l := rf.getLogByIndex(preIndex); l != nil {
+		preTerm = l.Term
+	}
+	// TODO 一次发送的Slots需要有个上限
+	return &AppendEntryArgs{
+		Term : rf.persistenceObj.curTerm,
+		PrevLogIndex: preIndex,
+		PrevLogTerm:  preTerm,
+		Slots:        rf.GetLogGtIndex(preIndex),
+	}
+}
+
+// GetLogGtIndex 获取index以后的log，顺序排列
+func (rf *Raft) GetLogGtIndex(index int) []*Log {
+	slots := rf.persistenceObj.slots
+	if len(slots) == 0 {
+		return nil
+	}
+	if index+1 < slots[0].Index {
+		rf.Error("input index %d invalid, min log index:%d", index, slots[0].Index)
+		return nil
+	}
+	i := index+1 - slots[0].Index
+	var logs []*Log
+	for ; i < len(slots); i++ {
+		logs = append(logs, slots[i])
+	}
+	return logs
+}
+
+func calculateAckIndex(req *AppendEntryArgs) int {
+	if len(req.Slots) == 0 {
+		return req.PrevLogIndex
+	}
+	return req.Slots[len(req.Slots)-1].Index
+}
+
+// leaderApply
+func (rf *Raft) leaderApply() {
+	rf.tryApply = make(chan struct{}, 10)
+	for {
+		<-rf.tryApply
+		follows := 1
+		for i := 0; i < len(rf.peers); i++ {
+			if i == rf.me {
+				continue
+			}
+			if rf.peersAckMaxLogIndexes[i] > rf.maxAppliedLogIndex {
+				follows++
+			}
+		}
+		if follows*2 < len(rf.peers) {
+			break
+		}
+		rf.maxAppliedLogIndex++
+		rf.applyCh <- ApplyMsg{
+			CommandValid:  true,
+			Command:       rf.getLogByIndex(rf.maxAppliedLogIndex).Command,
+			CommandIndex:  rf.maxAppliedLogIndex,
+			SnapshotValid: false,
+		}
 	}
 }
 
@@ -266,12 +673,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-
+	rf.applyCh = applyCh
+	rf.leaderHeartBeat = make(chan struct{}, 10)
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
-
+	rf.Debug("started")
 	return rf
 }
