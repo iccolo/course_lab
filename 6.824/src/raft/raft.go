@@ -67,31 +67,37 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 	applyCh               chan ApplyMsg
-	persistenceObj        *persistenceObj // 需要持久化的数据，在Raft创建时读取并初始化
+	persistenceObj        *PersistenceObj // 需要持久化的数据，在Raft创建时读取并初始化
 	leaderHeartBeat       chan struct{}   // 接收Leader心跳并更新定时器，在Raft创建时初始化
 	peersMaxLogIndexes    []int           // 作为Leader时，其他节点的Max Log Index，初始化时会设定为Leader的Max Log Index
 	peersAckMaxLogIndexes []int           // 作为Leader时，其他节点的Max Ack Log Index，初始化设定-1
 	tryApply              chan struct{}   // 通知Apply goroutine发送ApplyMsg
+	trySyncPeer           []chan struct{} // 通知Sync goroutine发送AppendEntry
 	maxAppliedLogIndex    int             // 作为Follower时，Max Applied Log Index，初始化设定-1
+	leaderRun             sync.Once       // 成为Leader后要运行的
+}
+
+func init() {
+	log.Default().SetFlags(log.Lshortfile | log.Lmicroseconds)
 }
 
 func (rf *Raft) Debug(format string, args ...interface{}) {
-	prefix := fmt.Sprintf("[node %d]", rf.me)
-	log.Printf(prefix+format, args...)
+	prefix := fmt.Sprintf("[DEBUG][node %d]", rf.me)
+	log.Default().Output(2, fmt.Sprintf(prefix+format, args...))
 }
 
 func (rf *Raft) Error(format string, args ...interface{}) {
-	prefix := fmt.Sprintf("[node %d]", rf.me)
-	log.Printf(prefix+format, args...)
+	prefix := fmt.Sprintf("[ERROR][node %d]", rf.me)
+	log.Default().Output(2, fmt.Sprintf(prefix+format, args...))
 }
 
-type persistenceObj struct {
-	curTerm           int
-	voteFor           int
-	snapshotLastIndex int
-	snapshotLastTerm  int
-	slots             []*Log
-	snapshot          []byte
+type PersistenceObj struct {
+	CurTerm           int
+	VoteFor           int
+	SnapshotLastIndex int
+	SnapshotLastTerm  int
+	Slots             []*Log
+	Snapshot          []byte
 }
 
 type Log struct {
@@ -101,32 +107,32 @@ type Log struct {
 }
 
 func (rf *Raft) getLastLogInfo() (index, term int) {
-	slots := rf.persistenceObj.slots
+	slots := rf.persistenceObj.Slots
 	if len(slots) == 0 {
-		return rf.persistenceObj.snapshotLastIndex, rf.persistenceObj.snapshotLastTerm
+		return rf.persistenceObj.SnapshotLastIndex, rf.persistenceObj.SnapshotLastTerm
 	}
 	lastLog := slots[len(slots)-1]
 	return lastLog.Index, lastLog.Term
 }
 
 func (rf *Raft) getLastLogIndex() int {
-	slots := rf.persistenceObj.slots
+	slots := rf.persistenceObj.Slots
 	if len(slots) == 0 {
-		return rf.persistenceObj.snapshotLastIndex
+		return rf.persistenceObj.SnapshotLastIndex
 	}
 	return slots[len(slots)-1].Index
 }
 
 func (rf *Raft) getLastLogTerm() int {
-	slots := rf.persistenceObj.slots
+	slots := rf.persistenceObj.Slots
 	if len(slots) == 0 {
-		return rf.persistenceObj.snapshotLastTerm
+		return rf.persistenceObj.SnapshotLastTerm
 	}
 	return slots[len(slots)-1].Term
 }
 
 func (rf *Raft) getLogByIndex(index int) *Log {
-	slots := rf.persistenceObj.slots
+	slots := rf.persistenceObj.Slots
 	if len(slots) == 0 {
 		return nil
 	}
@@ -141,7 +147,8 @@ func (rf *Raft) getLogByIndex(index int) *Log {
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
 	// Your code here (2A).
-	return rf.persistenceObj.curTerm, rf.persistenceObj.curTerm > 0 && rf.me == rf.persistenceObj.voteFor
+	// rf.Debug("CurTerm:%v, VoteFor:%v", rf.persistenceObj.CurTerm, rf.persistenceObj.VoteFor)
+	return rf.persistenceObj.CurTerm, rf.persistenceObj.CurTerm > 0 && rf.me == rf.persistenceObj.VoteFor
 }
 
 //
@@ -170,6 +177,7 @@ func (rf *Raft) persist() {
 // restore previously persisted state.
 //
 func (rf *Raft) readPersist(data []byte) {
+	rf.persistenceObj = new(PersistenceObj)
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
@@ -186,7 +194,6 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
-	rf.persistenceObj = new(persistenceObj)
 	dec := labgob.NewDecoder(bytes.NewBuffer(data))
 	if err := dec.Decode(rf.persistenceObj); err != nil {
 		panic(err)
@@ -203,10 +210,10 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	rf.maxAppliedLogIndex = lastIncludedIndex
-	rf.persistenceObj.slots = nil
-	rf.persistenceObj.snapshot = snapshot
-	rf.persistenceObj.snapshotLastIndex = lastIncludedIndex
-	rf.persistenceObj.snapshotLastTerm = lastIncludedTerm
+	rf.persistenceObj.Slots = nil
+	rf.persistenceObj.Snapshot = snapshot
+	rf.persistenceObj.SnapshotLastIndex = lastIncludedIndex
+	rf.persistenceObj.SnapshotLastTerm = lastIncludedTerm
 	return true
 }
 
@@ -223,10 +230,10 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	l := rf.getLogByIndex(index)
-	rf.persistenceObj.snapshotLastIndex, rf.persistenceObj.snapshotLastTerm = l.Index, l.Term
-	rf.persistenceObj.snapshot = snapshot
-	firstIndex := rf.persistenceObj.slots[0].Index
-	rf.persistenceObj.slots = rf.persistenceObj.slots[index+1-firstIndex:]
+	rf.persistenceObj.SnapshotLastIndex, rf.persistenceObj.SnapshotLastTerm = l.Index, l.Term
+	rf.persistenceObj.Snapshot = snapshot
+	firstIndex := rf.persistenceObj.Slots[0].Index
+	rf.persistenceObj.Slots = rf.persistenceObj.Slots[index+1-firstIndex:]
 	rf.persist()
 }
 
@@ -259,12 +266,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.Debug("receive RequestVote, args:%+v", args)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	if args.LatestLogTerm > rf.persistenceObj.curTerm ||
-		(args.LatestLogTerm == rf.persistenceObj.curTerm && args.LatestLogIndex >= rf.getLastLogIndex()) {
-		rf.persistenceObj.curTerm = args.Term
-		rf.persistenceObj.voteFor = args.From
+	if args.LatestLogTerm > rf.getLastLogTerm() ||
+		(args.LatestLogTerm == rf.getLastLogTerm() && args.LatestLogIndex >= rf.getLastLogIndex()) {
+		rf.persistenceObj.CurTerm = args.Term
+		rf.persistenceObj.VoteFor = args.From
 		rf.persist()
 		reply.IsAgree = true
+		rf.leaderHeartBeat <- struct{}{}
 		rf.Debug("accept node %d as leader", args.From)
 		return
 	}
@@ -301,7 +309,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // the struct itself.
 //
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	rf.Debug("RequestVote args:%+v", args)
+	rf.Debug("RequestVote to server:%v, args:%+v", server, args)
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	rf.Debug("RequestVote reply:%+v", reply)
 	return ok
@@ -327,7 +335,7 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 	rf.Debug("receive AppendEntry, args:%+v", args)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	if args.Term < rf.persistenceObj.curTerm || (args.Term == rf.persistenceObj.curTerm && args.From != rf.persistenceObj.voteFor) {
+	if args.Term < rf.persistenceObj.CurTerm || (args.Term == rf.persistenceObj.CurTerm && args.From != rf.persistenceObj.VoteFor) {
 		rf.Error("invalid AppendEntry:%+v", args) // TODO how to fill rsp
 		return
 	}
@@ -335,12 +343,13 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 
 	// 接收首次Log，或者在args.PrevLogIndex位置是快照的最后一条
 	if args.PrevLogIndex == 0 ||
-		(args.PrevLogIndex == rf.persistenceObj.snapshotLastIndex &&
-			args.PrevLogTerm == rf.persistenceObj.snapshotLastTerm) {
-		rf.persistenceObj.slots = args.Slots
-		rf.persistenceObj.curTerm = args.Term
-		rf.persistenceObj.voteFor = args.From
+		(args.PrevLogIndex == rf.persistenceObj.SnapshotLastIndex &&
+			args.PrevLogTerm == rf.persistenceObj.SnapshotLastTerm) {
+		rf.persistenceObj.Slots = args.Slots
+		rf.persistenceObj.CurTerm = args.Term
+		rf.persistenceObj.VoteFor = args.From
 		rf.followerApply(args.CommittedIndex)
+		rf.Debug("receive AppendEntry ok")
 		return
 	}
 
@@ -349,16 +358,18 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 	if preLog == nil {
 		reply.XTerm = -1
 		reply.XLen = args.PrevLogIndex - rf.getLastLogIndex()
+		rf.Debug("follower has no log at index:%v", args.PrevLogIndex)
 		return
 	}
 	// 对应位置Log Term相同，更新Log
 	if preLog.Term == args.PrevLogTerm {
-		rf.persistenceObj.curTerm = args.Term
-		rf.persistenceObj.voteFor = args.From
-		firstIndex := rf.persistenceObj.slots[0].Index
-		rf.persistenceObj.slots = append(rf.persistenceObj.slots[:args.PrevLogIndex-firstIndex+1], args.Slots...)
+		rf.persistenceObj.CurTerm = args.Term
+		rf.persistenceObj.VoteFor = args.From
+		firstIndex := rf.persistenceObj.Slots[0].Index
+		rf.persistenceObj.Slots = append(rf.persistenceObj.Slots[:args.PrevLogIndex-firstIndex+1], args.Slots...)
 		reply.XTerm = args.PrevLogTerm
 		rf.followerApply(args.CommittedIndex)
+		rf.Debug("receive AppendEntry ok")
 		return
 	}
 	// 对应位置Log Term不同，找到当前节点log在args.PrevLogIndex位置的任期号，reply.XTerm设置为该任期号，并找到该任期号下最前一条log的index返回给reply.XIndex
@@ -402,25 +413,30 @@ func (rf *Raft) sendAppendEntry(server int, args *AppendEntryArgs, reply *Append
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (index int, term int, isLeader bool) {
+	rf.Debug("receive new command")
 	// 串行化追加log
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	term, isLeader = rf.GetState()
 	if !isLeader {
 		rf.Error("Start but is follower")
 		return -1, -1, false
 	}
 	index = rf.getLastLogIndex() + 1
-	rf.persistenceObj.slots = append(rf.persistenceObj.slots, &Log{
+	rf.persistenceObj.Slots = append(rf.persistenceObj.Slots, &Log{
 		Index:   index,
 		Term:    term,
 		Command: command,
 	})
 	labgob.Register(command)
 	rf.persist()
-	rf.mu.Unlock()
-	rf.Debug("receive log index:%v", index)
-	// 通知其他节点
-	go rf.syncAllPeer()
+	for i := 0; i < len(rf.peers); i++ {
+		if i == rf.me {
+			continue
+		}
+		rf.trySyncPeer[i] <- struct{}{}
+	}
+	rf.Debug("receive as log index:%v", index)
 	return index, term, isLeader
 }
 
@@ -459,12 +475,10 @@ func (rf *Raft) ticker() {
 		}
 		interval := getElectionTimerInterval()
 		t := time.NewTimer(interval)
-		rf.Debug("start election timer, timer interval:%v", rf.me, interval)
+		rf.Debug("start election timer, timer interval:%v", interval)
 		select {
 		case <-rf.leaderHeartBeat:
-			interval = getElectionTimerInterval()
-			t = time.NewTimer(interval)
-			rf.Debug("restart election timer, timer interval:%v", rf.me, interval)
+			rf.Debug("will restart election timer")
 		case <-t.C:
 			rf.campaign()
 		}
@@ -473,9 +487,9 @@ func (rf *Raft) ticker() {
 }
 
 const (
-	leaderHeartBeatInterval      = 3000 // 心跳间隔，单位ms
-	electionTimerIntervalRateMin = 2    // 最小选举定时器与心跳间隔比值
-	electionTimerIntervalRateMax = 3    // 最大选举定时器与心跳间隔比值
+	leaderHeartBeatInterval      = 100 // 心跳间隔，单位ms
+	electionTimerIntervalRateMin = 3   // 最小选举定时器与心跳间隔比值
+	electionTimerIntervalRateMax = 5   // 最大选举定时器与心跳间隔比值
 )
 
 func getElectionTimerInterval() time.Duration {
@@ -490,19 +504,16 @@ func getElectionTimerInterval() time.Duration {
 func (rf *Raft) campaign() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	newTerm := rf.persistenceObj.curTerm + 1
-	votesCnt := int64(1) // 当前任期获得的Leader选票数量
+	newTerm := rf.persistenceObj.CurTerm + 1
 
 	rf.Debug("begin campaign term:%d", newTerm)
 
-	wg := new(sync.WaitGroup)
+	results := make(chan bool, len(rf.peers))
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
 			continue
 		}
-		wg.Add(1)
 		go func(i int) {
-			defer wg.Done()
 			req := &RequestVoteArgs{
 				From: rf.me,
 				Term: newTerm,
@@ -510,21 +521,39 @@ func (rf *Raft) campaign() {
 			req.LatestLogIndex, req.LatestLogTerm = rf.getLastLogInfo()
 			rsp := &RequestVoteReply{}
 			if ok := rf.sendRequestVote(i, req, rsp); ok && rsp.IsAgree {
-				rf.Debug("won votes from node %d in term %d", newTerm, i)
-				atomic.AddInt64(&votesCnt, 1)
+				rf.Debug("won votes from node %d in term %d", i, newTerm)
+				results <- true
+			} else {
+				results <- false
 			}
 		}(i)
 	}
-	wg.Wait()
-	rf.Debug("votesCnt %d", votesCnt)
+	var (
+		disagreeCnt = 0
+		agreeCnt    = 1 // 当前任期获得的Leader选票数量
+	)
+	for isAgree := range results {
+		if isAgree {
+			agreeCnt++
+			if agreeCnt*2 > len(rf.peers) {
+				break
+			}
+		} else {
+			disagreeCnt++
+		}
+		if 2*disagreeCnt >= len(rf.peers) || agreeCnt+disagreeCnt >= len(rf.peers) {
+			break
+		}
+	}
+	rf.Debug("agreeCnt %d", agreeCnt)
 	// 判断投票结果
-	if votesCnt*2 <= int64(len(rf.peers)) {
+	if agreeCnt*2 <= len(rf.peers) {
 		return
 	}
-	rf.persistenceObj.curTerm++
-	rf.persistenceObj.voteFor = rf.me
+	rf.persistenceObj.CurTerm++
+	rf.persistenceObj.VoteFor = rf.me
 	rf.persist()
-	rf.Debug("being leader, term %v", rf.persistenceObj.curTerm)
+	rf.Debug("being leader, term %v", rf.persistenceObj.CurTerm)
 	go rf.afterWonCampaign()
 }
 
@@ -534,10 +563,10 @@ var leaderApplyRun sync.Once
 func (rf *Raft) afterWonCampaign() {
 	rf.initPeerMaxLogIndex()
 	rf.initPeersAckMaxLogIndexes()
-	leaderApplyRun.Do(func() {
+	rf.leaderRun.Do(func() {
 		go rf.leaderApply()
 	})
-	rf.syncAllPeer()
+	go rf.syncAllPeer()
 }
 
 // Leader初始化PeerMaxLogIndex，刚开始所有节点的Max Log Index设置为与Leader一致
@@ -555,18 +584,29 @@ func (rf *Raft) initPeersAckMaxLogIndexes() {
 
 func (rf *Raft) syncAllPeer() {
 	// 通知其他节点对齐Log
-	wg := new(sync.WaitGroup)
+	rf.trySyncPeer = make([]chan struct{}, len(rf.peers))
+
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
 			continue
 		}
-		wg.Add(1)
+		rf.trySyncPeer[i] = make(chan struct{})
 		go func(server int) {
-			defer wg.Done()
 			rf.syncPeer(server)
+			for {
+				if _, isLeader := rf.GetState(); !isLeader {
+					break
+				}
+				t := time.NewTimer(time.Millisecond * time.Duration(leaderHeartBeatInterval))
+				select {
+				case <-t.C:
+					rf.syncPeer(server)
+				case <-rf.trySyncPeer[server]:
+					rf.syncPeer(server)
+				}
+			}
 		}(i)
 	}
-	wg.Wait()
 }
 
 func (rf *Raft) syncPeer(server int) {
@@ -608,17 +648,17 @@ func (rf *Raft) genAppendEntry(server int) *AppendEntryArgs {
 		preTerm  = 0
 	)
 	// 需要先发送snapshot
-	if preIndex < rf.persistenceObj.snapshotLastIndex {
+	if preIndex < rf.persistenceObj.SnapshotLastIndex {
 		if ok := rf.sendInstallSnapshot(server, &InstallSnapshotArgs{
-			LastIncludedIndex: rf.persistenceObj.snapshotLastIndex,
-			LastIncludedTerm:  rf.persistenceObj.snapshotLastTerm,
-			Snapshot:          rf.persistenceObj.snapshot,
+			LastIncludedIndex: rf.persistenceObj.SnapshotLastIndex,
+			LastIncludedTerm:  rf.persistenceObj.SnapshotLastTerm,
+			Snapshot:          rf.persistenceObj.Snapshot,
 		}, &InstallSnapshotReply{}); !ok {
 			return nil
 		}
-		rf.peersMaxLogIndexes[server] = rf.persistenceObj.snapshotLastIndex
-		preIndex = rf.persistenceObj.snapshotLastIndex
-		preTerm = rf.persistenceObj.snapshotLastTerm
+		rf.peersMaxLogIndexes[server] = rf.persistenceObj.SnapshotLastIndex
+		preIndex = rf.persistenceObj.SnapshotLastIndex
+		preTerm = rf.persistenceObj.SnapshotLastTerm
 	}
 	if l := rf.getLogByIndex(preIndex); l != nil {
 		preTerm = l.Term
@@ -626,7 +666,7 @@ func (rf *Raft) genAppendEntry(server int) *AppendEntryArgs {
 	// TODO 一次发送的Slots需要有个上限
 	return &AppendEntryArgs{
 		From:           rf.me,
-		Term:           rf.persistenceObj.curTerm,
+		Term:           rf.persistenceObj.CurTerm,
 		CommittedIndex: rf.maxAppliedLogIndex,
 		PrevLogIndex:   preIndex,
 		PrevLogTerm:    preTerm,
@@ -659,7 +699,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 
 // GetLogGtIndex 获取index以后的log，顺序排列
 func (rf *Raft) GetLogGtIndex(index int) []*Log {
-	slots := rf.persistenceObj.slots
+	slots := rf.persistenceObj.Slots
 	if len(slots) == 0 {
 		return nil
 	}
@@ -687,6 +727,7 @@ func (rf *Raft) leaderApply() {
 	rf.tryApply = make(chan struct{}, 10)
 	for {
 		<-rf.tryApply
+		rf.Debug("applied index:%v, ack indexes:%v", rf.maxAppliedLogIndex, rf.peersAckMaxLogIndexes)
 		follows := 1
 		for i := 0; i < len(rf.peers); i++ {
 			if i == rf.me {
@@ -697,7 +738,7 @@ func (rf *Raft) leaderApply() {
 			}
 		}
 		if follows*2 < len(rf.peers) {
-			break
+			continue
 		}
 		rf.maxAppliedLogIndex++
 		rf.applyCh <- ApplyMsg{
